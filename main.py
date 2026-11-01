@@ -28,6 +28,12 @@ class ConfigParameterCorrelationAnalyzer:
         self.config_file = config_file
         self.config_data = self._load_config()
         # Only the relationships the checks below actually evaluate.
+        # This mapping is never read by the checks below. The two
+        # comparisons are written out by hand in analyze_correlations,
+        # and checked_parameters beside it is a separate literal, so
+        # editing this dictionary changes nothing about what I check.
+        # It survives as a statement of intent, and it can drift away
+        # from the real checks without any test noticing.
         self.parameter_relationships = {
             "timeout": ["buffer_size"],
             "buffer_size": ["max_connections"],
@@ -85,10 +91,19 @@ class ConfigParameterCorrelationAnalyzer:
                 for key, value in node.items():
                     if key in self.checked_parameters and not isinstance(value, (dict, list)):
                         if key not in flat:
+                            # First occurrence wins, and occurrence order is the order the
+                            # document was written in. Two sections that both set timeout
+                            # are therefore not a conflict to me: the earlier one is the
+                            # value, and the later one is passed over without a word.
                             flat[key] = value
                     if isinstance(value, dict):
                         walk(value)
 
+        # The walk descends into mappings only. Parameters inside a
+        # list of entries, a common shape for server blocks, are never
+        # seen, and a checked parameter holding a mapping is skipped
+        # as a value while its children are still walked, so a scalar
+        # deeper down with the same name can become the value instead.
         walk(self.config_data)
         return flat
 
@@ -114,7 +129,18 @@ class ConfigParameterCorrelationAnalyzer:
 
         # Check 1: timeout against buffer_size.
         if "timeout" in params and "buffer_size" in params:
+            # These comparisons assume numbers. A timeout written as a
+            # quoted string in the config raises a TypeError here, which
+            # escapes analyze_correlations and is caught in main as a
+            # generic error: one badly typed value costs the whole file
+            # its analysis, including the check that did not involve it.
+            # The thresholds themselves, 60 and 1024, are my fixed
+            # judgements, not values the operator can tune.
             if params["timeout"] > 60 and params["buffer_size"] < 1024:
+                # The message calls buffer_size bytes. Nothing in the config
+                # or in my code establishes the unit; a file counting in
+                # kilobytes is judged, and reported, as if it counted in
+                # single bytes.
                 warnings.append(
                     f"Potential denial of service vulnerability: Timeout is set to {params['timeout']} seconds, but buffer size is only {params['buffer_size']} bytes. Increase buffer size."
                 )
